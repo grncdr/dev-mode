@@ -10,7 +10,11 @@
   "scripts": {
     "build": "tsc"
   },
-  "bin": "./dev-mode.js",
+  "bin": "dev-mode.js",
+  "files": [
+    "dev-mode.js",
+    "package.json"
+  ],
   "author": "Stephen Sugden <me@stephensugden.com>",
   "license": "GPL-3.0-or-later",
   "dependencies": {
