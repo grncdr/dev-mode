@@ -2,6 +2,10 @@
   "name": "dev-mode",
   "version": "1.0.0",
   "description": "An interactive process monitor for development time",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/grncdr/dev-mode"
+  },
   "main": "dev-mode",
   "scripts": {
     "build": "tsc"
