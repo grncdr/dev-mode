@@ -1,0 +1,13 @@
+{
+  "compileOnSave": true,
+  "files": ["dev-mode.ts"],
+  "compilerOptions": {
+    "moduleResolution": "node",
+    "module": "commonjs",
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "target": "es2017",
+    "strict": true,
+    "lib": ["es2017"]
+  }
+}

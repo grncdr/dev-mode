@@ -1,0 +1,19 @@
+{
+  "name": "dev-mode",
+  "version": "1.0.0",
+  "description": "An interactive process monitor for development time",
+  "main": "dev-mode",
+  "scripts": {
+    "build": "tsc"
+  },
+  "bin": "./dev-mode.js",
+  "author": "Stephen Sugden <me@stephensugden.com>",
+  "license": "GPL-3.0-or-later",
+  "dependencies": {
+    "node-pty": "^0.9.0-beta26"
+  },
+  "devDependencies": {
+    "@types/node": "^12.7.5",
+    "typescript": "^3.6.3"
+  }
+}

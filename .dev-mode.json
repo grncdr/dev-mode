@@ -1,0 +1,9 @@
+{
+  "logdir": "logs",
+  "jobs": {
+    "tsc": {
+      "cmd": "npx tsc --watch",
+      "autostart": true
+    }
+  }
+}
