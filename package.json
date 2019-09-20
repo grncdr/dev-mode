@@ -8,7 +8,7 @@
   },
   "main": "dev-mode",
   "scripts": {
-    "build": "tsc"
+    "prepublish": "tsc"
   },
   "bin": "dev-mode.js",
   "files": [
