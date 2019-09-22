@@ -278,6 +278,7 @@ class Coordinator {
     this.connectedJob = job
 
     return new Promise(resolve => {
+      setTerminalTitle(`dev-mode [${job.name}]`)
       // connect job to stdout
       const outputListener = job.pty!.onData(data => process.stdout.write(data))
 
@@ -608,6 +609,7 @@ function main() {
         }
       }
       await coordinator.connectJobToTerminal(job)
+      setTerminalTitle('dev-mode')
     },
 
     // job management
@@ -721,6 +723,7 @@ function main() {
   const r = coordinator.startRepl()
   r.on('exit', () => coordinator.evalCommand('stop'))
   process.on('exit', () => coordinator.evalCommand('stop'))
+  setTerminalTitle('dev-mode')
 }
 
 main()
