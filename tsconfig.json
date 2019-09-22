@@ -1,6 +1,6 @@
 {
   "compileOnSave": true,
-  "files": ["dev-mode.ts"],
+  "files": ["dev-mode.ts", "types.d.ts"],
   "compilerOptions": {
     "moduleResolution": "node",
     "module": "commonjs",
