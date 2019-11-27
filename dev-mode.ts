@@ -3,9 +3,10 @@ import assert from 'assert'
 import fs from 'fs'
 import path from 'path'
 import repl from 'repl'
-import { spawn, IPty } from 'node-pty'
+import { spawn, IPty, IDisposable } from 'node-pty'
 import minimist from 'minimist'
-import { split, quote } from 'shell-split'
+import { split } from 'shell-split'
+import { Transform, Writable } from 'stream'
 
 const defaultConfigFilename = '.dev-mode.json'
 const defaultSecretdir = '.dev-secrets'
@@ -18,12 +19,14 @@ Procfile, or docker-compose without docker. It's meant to run continuously in a
 terminal and allow you to quickly start & stop processes in a reproducible way.
 
 status                  Show the status of all jobs.
-start [JOB_NAME]        Start job(s).
-stop [JOB_NAME]         Stop job(s).
-connect JOB_NAME        Connect a specific job to your terminal.
+start [JOB]             Start job(s).
+stop [JOB]              Stop job(s).
+restart JOB [...JOB]    Restart running job(s).
+connect JOB             Connect a specific job to your terminal.
+tail JOB [...JOB]       Tail the output of the given jobs.
 
-add JOB_NAME COMMAND    Add a job to your configuration.
-rm JOB_NAME             Remove a job from your configuration.
+add JOB COMMAND    Add a job to your configuration.
+rm JOB             Remove a job from your configuration.
 
 show CONFIG_PATH        Show a config value
 set CONFIG_PATH VALUE   Set a config value
@@ -185,16 +188,24 @@ function writeConfig(filename: string, config: Config) {
   fs.writeFileSync(filename, JSON.stringify(config, null, 2))
 }
 
-function loadSecrets(config: Config, jobName: string) {
-  const secretsFilename = path.resolve(process.cwd(), config.secretdir, `${jobName}.json`)
+function loadSecrets(secretsFilename: string) {
   if (!fs.existsSync(secretsFilename)) {
     return {}
   }
   try {
     return JSON.parse(fs.readFileSync(secretsFilename, 'utf-8'))
   } catch (error) {
-    log(`error reading secrets for ${jobName}:`, error)
+    log(`error reading secrets file ${secretsFilename}:`, error)
     return {}
+  }
+}
+
+class ArgumentError extends Error {}
+
+class InvalidArgumentError extends ArgumentError {
+  constructor(type: string, values: string[]) {
+    super(`invalid ${type}${values.length === 1 ? '' : 's'}: ${values.join(', ')}`)
+    this.name = 'InvalidArgumentError'
   }
 }
 
@@ -222,12 +233,24 @@ class Coordinator {
         this.jobs.get(name)!.applyConfig(jobConfig)
       } else {
         const logFilename = `${config.logdir}/${name}.log`
+        const logfileStream = fs.createWriteStream(logFilename)
+        // create a pass-through stream that we can pipe to console for `tail`
+        const output = new Transform({
+          transform(data, encoding, callback) {
+            callback(null, data)
+          },
+        })
+        output.pipe(logfileStream)
+        logfileStream.on('error', err => output.emit('error', err))
+        const secretsFilename = path.resolve(process.cwd(), config.secretdir, `${name}.json`)
         const job: Job = new Job(
           name,
           jobConfig,
-          fs.createWriteStream(logFilename),
-          () => loadSecrets(this.config, name),
-          () => this.connectJobToTerminal(job),
+          output,
+          secretsFilename,
+          (matchedOutput: string) => {
+            this.connectJobToTerminal(job, matchedOutput)
+          },
         )
         this.jobs.set(name, job)
         if (jobConfig.autostart) {
@@ -238,6 +261,23 @@ class Coordinator {
     this.config = config
   }
 
+  getJobs(names: string[]): Job[] {
+    const invalidNames = []
+    const jobs = []
+    for (const name of names) {
+      const job = this.jobs.get(name)
+      if (job) {
+        jobs.push(job)
+      } else {
+        invalidNames.push(name)
+      }
+    }
+    if (invalidNames.length) {
+      throw new InvalidArgumentError('job', invalidNames)
+    }
+    return jobs
+  }
+
   startRepl(): repl.REPLServer {
     this.repl = repl.start({
       prompt: 'dev-mode> ',
@@ -245,7 +285,14 @@ class Coordinator {
       eval: (input, _ctx, _file, callback) => {
         this.evalCommand(input).then(
           () => callback(null, undefined),
-          error => callback(error, undefined),
+          error => {
+            if (error instanceof ArgumentError) {
+              console.error(error.message)
+              callback(null, undefined)
+            } else {
+              callback(error, undefined)
+            }
+          },
         )
       },
     })
@@ -261,39 +308,57 @@ class Coordinator {
     }
     const command = this.commands[commandName]
     if (!command) {
-      throw 'Unrecognized command: ' + commandName
+      console.error('Unrecognized command: ' + commandName)
+      return
     }
     return command(i < 0 ? [] : split(input.slice(i + 1)))
   }
 
-  connectJobToTerminal(job: Job) {
+  connectJobToTerminal(job: Job, matchedOutput?: string) {
     if (this.connectedJob) {
       return Promise.resolve()
     }
 
     const pty = job.pty!
 
-    console.log('connecting to ', job.name, 'press Ctrl-a followed by d to disconnect')
+    console.log(
+      `${matchedOutput ? 'autoconnected' : 'connected'} to ${
+        job.name
+      } ... press Ctrl-a followed by d to disconnect`,
+    )
+    if (matchedOutput) {
+      process.stdout.write(matchedOutput)
+    }
 
     this.connectedJob = job
 
-    return new Promise(resolve => {
-      setTerminalTitle(`dev-mode [${job.name}]`)
-      // connect job to stdout
-      const outputListener = job.pty!.onData(data => process.stdout.write(data))
+    setTerminalTitle(`dev-mode [${job.name}]`)
+    const [restoreInput, quitRequested] = this.enterCommandMode(job)
+    // connect job to stdout
+    const outputListener = pty.onData(data => process.stdout.write(data))
+    let exitListener: IDisposable
 
-      const exitListener = pty.onExit(() => {
-        disconnect()
-      })
-
-      const disconnect = () => {
-        ;(this.repl as any)._ttyWrite = ttyWrite
-        outputListener.dispose()
-        exitListener.dispose()
-        this.connectedJob = undefined
+    const processExited = new Promise(resolve => {
+      exitListener = pty.onExit(() => {
         resolve()
-      }
+      })
+    })
 
+    return Promise.race([quitRequested, processExited]).then(() => {
+      outputListener.dispose()
+      exitListener.dispose()
+      restoreInput()
+      this.connectedJob = undefined
+    })
+  }
+
+  enterCommandMode(job?: Job): [() => void, Promise<void>] {
+    // monkey patch the repl servers ttyWrite to redirect input
+    const ttyWrite = (this.repl as any)._ttyWrite
+    const restoreTTYInput = () => {
+      ;(this.repl as any)._ttyWrite = ttyWrite
+    }
+    const quitRequested = new Promise<void>(resolve => {
       // monkey patch the repl servers ttyWrite to redirect input
       const ttyWrite = (this.repl as any)._ttyWrite
 
@@ -309,18 +374,19 @@ class Coordinator {
           }
         } else if (commandMode) {
           if (key && key.name === 'd') {
-            disconnect()
+            resolve()
           }
-        } else if (!job.pty) {
+        } else if (!job || !job.pty) {
           // if you're typing while the process exits, we just drop that data
         } else if (data) {
-          pty.write(data)
+          job.pty.write(data)
         } else if (key) {
           // we've received an unprintable key
-          pty.write(key.sequence)
+          job.pty.write(key.sequence)
         }
       }
     })
+    return [restoreTTYInput, quitRequested]
   }
 }
 
@@ -344,9 +410,9 @@ class Job {
   constructor(
     public name: string,
     public config: JobConfig,
-    private outputStream: fs.WriteStream,
-    private getSecrets: () => { [key: string]: string },
-    private onAutoConnect: () => void,
+    public outputStream: Writable,
+    private secretsFilename: string,
+    private onAutoConnect: (matchedOutput: string) => void,
   ) {
     this.state = JobState.Stopped
     this.pty = undefined
@@ -362,13 +428,18 @@ class Job {
       throw new Error('Job already running')
     }
 
-    // Spawn the actual child process
-    let secrets
-    try {
-      secrets = this.getSecrets()
-    } catch (error) {
-      log(`could not load secrets file for ${this.name}: ${error}`)
+    // load secrets and set up a file watcher
+    let secrets = {}
+    if (fs.existsSync(this.secretsFilename)) {
+      secrets = loadSecrets(this.secretsFilename)
+      const secretsWatcher = fs
+        .watch(this.secretsFilename, { persistent: false })
+        .on('change', () => {
+          secretsWatcher.removeAllListeners('change')
+          this.restart()
+        })
     }
+    // Spawn the actual child process
     this.pty = spawn('bash', ['-c', this.config.cmd], {
       name: 'xterm-256color',
       env: { ...process.env, ...this.config.env, ...secrets } as JobConfig['env'],
@@ -376,7 +447,7 @@ class Job {
     })
     const outputListener = this.pty.onData(data => {
       if (this.autoconnect && this.autoconnect.test(data)) {
-        this.onAutoConnect()
+        this.onAutoConnect(data)
       }
       this.outputStream.write(data)
     })
@@ -393,10 +464,11 @@ class Job {
     this.pty.pid
   }
 
-  applyConfig(newConfig: JobConfig) {
-    this.config = newConfig
+  applyConfig(next: JobConfig) {
+    const prev = this.config
+    this.config = next
     if (
-      (newConfig.cmd !== this.config.cmd || !deepEqual(newConfig.env, this.config.env)) &&
+      (next.cmd !== prev.cmd || !deepEqual(next.env, prev.env)) &&
       this.state !== JobState.Stopped
     ) {
       this.restart()
@@ -405,7 +477,7 @@ class Job {
 
   restart() {
     this.state = JobState.Restarting
-    this.kill()
+    return this.kill()
   }
 
   stop() {
@@ -429,19 +501,18 @@ class Job {
       return
     }
     this.clearTimeout()
-    const process = this.pty
     this.timeout = setTimeout(() => {
       if (this.pty) {
-        log(`Sending SIGKILL to job ${this.name} after 3 seconds`)
-        this.pty.kill('SIGKILL')
+        log(`Sending SIGKILL to ${this.name} (PID: ${this.pty.pid}) after 3 seconds`)
+        process.kill(this.pty.pid, 'SIGKILL')
       }
     }, 3000)
+    const pty = this.pty
     return new Promise(resolve => {
-      const exitListener = process.onExit(() => {
-        exitListener.dispose()
+      pty.onExit(() => {
         resolve()
       })
-      process.kill()
+      process.kill(pty.pid, 'SIGINT')
     })
   }
 
@@ -517,6 +588,10 @@ function setIn(o: any, path: string[], val: any): any {
   return copy
 }
 
+function defined<T>(x: T | undefined): x is T {
+  return typeof x !== 'undefined'
+}
+
 function mkdirp(dir: string) {
   const parts = path.resolve(process.cwd(), dir).split(path.sep)
   parts.forEach((_, idx) => {
@@ -538,23 +613,6 @@ function main() {
   }
   const config = loadConfig(configFilename)
 
-  function jobCommand(fn: (job: Job) => void) {
-    return async ([name]: string[]) => {
-      if (!name) {
-        for (const job of coordinator.jobs.values()) {
-          await fn(job)
-        }
-      } else {
-        const job = coordinator.jobs.get(name)
-        if (!job) {
-          log('no such job:', name)
-        } else {
-          await fn(job)
-        }
-      }
-    }
-  }
-
   const coordinator: Coordinator = new Coordinator(config, {
     help: ([commandName]) => {
       if (!commandName) {
@@ -570,14 +628,43 @@ function main() {
     },
 
     // process management
-    start: jobCommand(job => {
-      if (job.state !== JobState.Stopped) {
-        log('job already running:', job.name)
-      } else {
-        job.start()
+    start: argv => {
+      const args = minimist(argv, { boolean: ['all'], alias: { all: 'a' } })
+      const jobs = coordinator.getJobs(args._)
+
+      if (jobs.length === 0) {
+        for (const job of coordinator.jobs.values()) {
+          if (job.config.autostart || args.all) {
+            jobs.push(job)
+          }
+        }
       }
-    }),
-    stop: jobCommand(job => job.stop()),
+
+      jobs.forEach(job => {
+        if (job.state !== JobState.Stopped) {
+          log('job already running:', job.name)
+        } else {
+          job.start()
+        }
+      })
+    },
+
+    stop: async jobNames => {
+      const jobs = coordinator.getJobs(jobNames)
+      if (jobs.length === 0) {
+        jobs.push(...coordinator.jobs.values())
+      }
+      await Promise.all(jobs.map(job => job.stop()))
+    },
+
+    restart: async jobNames => {
+      const jobs = coordinator.getJobs(jobNames)
+      if (jobs.length === 0) {
+        throw new ArgumentError('restart requires one or more job names')
+      }
+      await Promise.all(jobs.map(job => job.restart()))
+    },
+
     status: () => {
       const statuses: { [key: string]: any } = {}
       for (const job of coordinator.jobs.values()) {
@@ -590,19 +677,18 @@ function main() {
       }
       console.table(statuses)
     },
-    connect: async ([jobName]) => {
-      if (!jobName) {
-        console.error('job name argument is required')
-        return
+
+    connect: async argv => {
+      if (argv.length !== 1 || !argv[0].trim()) {
+        throw new ArgumentError('exactly one job argument is required')
       }
+      const [jobName] = argv
       const job = coordinator.jobs.get(jobName)
       if (!job) {
-        console.error('no such job:', jobName)
-        return
+        throw new InvalidArgumentError('job', [jobName])
       }
       if (!job.pty) {
         job.start()
-        await new Promise(r => setTimeout(r, 100))
         if (!job.pty) {
           console.error('failed to start job:', jobName)
           return
@@ -610,6 +696,51 @@ function main() {
       }
       await coordinator.connectJobToTerminal(job)
       setTerminalTitle('dev-mode')
+    },
+
+    tail: async jobNames => {
+      const jobs =
+        jobNames.length === 0
+          ? [...coordinator.jobs.values()]
+          : jobNames
+              .map(name => {
+                if (coordinator.jobs.has(name)) {
+                  return coordinator.jobs.get(name)
+                } else {
+                  console.error('no such job:', name)
+                }
+              })
+              .filter(defined)
+
+      if (jobs.length < jobNames.length) {
+        return
+      }
+      const prefixLen = Math.max(...jobNames.map(n => n.length))
+      const cleanup = jobs.map(job => {
+        const prefix = job.name.padEnd(prefixLen, ' ') + ' | '
+        let partialLine = ''
+        const onData = (data: string) => {
+          const lines = data.toString().split('\n')
+          if (lines.length) {
+            lines[0] = partialLine + lines[0]
+          }
+          if (lines.length) {
+            partialLine = lines.pop()!
+          }
+          process.stdout.write(lines.map(line => prefix + line).join('\n') + '\n')
+        }
+        job.outputStream.on('data', onData)
+        return () => {
+          job.outputStream.removeListener('data', onData)
+        }
+      })
+      const [restoreInput, quitRequested] = coordinator.enterCommandMode()
+      try {
+        await quitRequested
+      } finally {
+        cleanup.forEach(cb => cb())
+        restoreInput()
+      }
     },
 
     // job management
@@ -716,8 +847,7 @@ function main() {
     }
   }
 
-  const w = fs.watch(configFilename, { persistent: false })
-  w.on('change', () => coordinator.evalCommand('reload'))
+  fs.watch(configFilename, { persistent: false }, () => coordinator.evalCommand('reload'))
 
   coordinator.evalCommand('reload')
   const r = coordinator.startRepl()
