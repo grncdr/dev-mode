@@ -18,7 +18,7 @@
   "author": "Stephen Sugden <me@stephensugden.com>",
   "license": "GPL-3.0-or-later",
   "dependencies": {
-    "minimist": "^1.2.0",
+    "minimist": "^1.2.2",
     "node-pty": "^0.9.0-beta26",
     "shell-split": "^1.0.0"
   },
