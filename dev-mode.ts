@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import assert from 'assert'
 import fs from 'fs'
+import { maxHeaderSize } from 'http'
+import minimist from 'minimist'
+import { IDisposable, IPty, spawn } from 'node-pty'
 import path from 'path'
 import repl from 'repl'
-import { spawn, IPty, IDisposable } from 'node-pty'
-import minimist from 'minimist'
 import { split } from 'shell-split'
-import { Transform, Writable } from 'stream'
+import { Transform, TransformCallback, TransformOptions, Writable } from 'stream'
 
 const defaultConfigFilename = '.dev-mode.json'
 const defaultSecretdir = '.dev-secrets'
@@ -200,6 +201,66 @@ function loadSecrets(secretsFilename: string) {
   }
 }
 
+class CircularLineBuffer extends Transform {
+  private position: number
+  private bufferSizeInLines: number
+  private lineBuffer: string[]
+  private partialLine?: string
+
+  constructor(opts: TransformOptions & { linesToBuffer?: number } = {}) {
+    super(opts)
+    this.position = 0
+    this.bufferSizeInLines = opts.linesToBuffer || 10
+    this.lineBuffer = new Array(this.bufferSizeInLines)
+  }
+
+  _transform(data: any, _encoding: string, callback: TransformCallback) {
+    let string = data.toString('utf-8') as string
+    let index = 0
+    while ((index = string.indexOf('\n')) >= 0) {
+      this.addLineToBuffer(string.slice(0, index + 1))
+      string = string.slice(index + 1)
+    }
+    this.partialLine = string
+    callback(null, data)
+  }
+
+  private addLineToBuffer(line: string) {
+    if (this.partialLine) {
+      line = this.partialLine + line
+      this.partialLine = undefined
+    }
+    this.lineBuffer[this.position] = line
+    this.position = (this.position + 1) % this.bufferSizeInLines
+    this.emit('line', line)
+  }
+
+  writeBufferedLinesTo(dest: Writable) {
+    this.lineBuffer.forEach((line) => dest.write(line))
+    let index = this.position + 1
+    let written = 0
+    while (written < this.lineBuffer.length) {
+      if (typeof this.lineBuffer[index] === 'string') {
+        dest.write(this.lineBuffer[index])
+      }
+      written += 1
+      index = (index + 1) % this.bufferSizeInLines
+    }
+  }
+}
+
+class Prefixer extends Transform {
+  private prefix: string
+  constructor({ prefix, ...opts }: TransformOptions & { prefix: string }) {
+    super(opts)
+    this.prefix = prefix
+  }
+
+  _transform(data: any, _encoding: string, callback: TransformCallback) {
+    callback(null, this.prefix + data)
+  }
+}
+
 class ArgumentError extends Error {}
 
 class InvalidArgumentError extends ArgumentError {
@@ -235,13 +296,11 @@ class Coordinator {
         const logFilename = `${config.logdir}/${name}.log`
         const logfileStream = fs.createWriteStream(logFilename)
         // create a pass-through stream that we can pipe to console for `tail`
-        const output = new Transform({
-          transform(data, encoding, callback) {
-            callback(null, data)
-          },
-        })
+        const bufferedLines = []
+        let partialLine = ''
+        const output = new CircularLineBuffer()
         output.pipe(logfileStream)
-        logfileStream.on('error', err => output.emit('error', err))
+        logfileStream.on('error', (err) => output.emit('error', err))
         const secretsFilename = path.resolve(process.cwd(), config.secretdir, `${name}.json`)
         const job: Job = new Job(
           name,
@@ -285,7 +344,7 @@ class Coordinator {
       eval: (input, _ctx, _file, callback) => {
         this.evalCommand(input).then(
           () => callback(null, undefined),
-          error => {
+          (error) => {
             if (error instanceof ArgumentError) {
               console.error(error.message)
               callback(null, undefined)
@@ -326,7 +385,9 @@ class Coordinator {
         job.name
       } ... press Ctrl-a followed by d to disconnect`,
     )
+    job.outputStream.writeBufferedLinesTo(process.stdout)
     if (matchedOutput) {
+      // this might be redundant now...
       process.stdout.write(matchedOutput)
     }
 
@@ -335,10 +396,10 @@ class Coordinator {
     setTerminalTitle(`dev-mode [${job.name}]`)
     const [restoreInput, quitRequested] = this.enterCommandMode(job)
     // connect job to stdout
-    const outputListener = pty.onData(data => process.stdout.write(data))
+    const outputListener = pty.onData((data) => process.stdout.write(data))
     let exitListener: IDisposable
 
-    const processExited = new Promise(resolve => {
+    const processExited = new Promise((resolve) => {
       exitListener = pty.onExit(() => {
         resolve()
       })
@@ -358,7 +419,7 @@ class Coordinator {
     const restoreTTYInput = () => {
       ;(this.repl as any)._ttyWrite = ttyWrite
     }
-    const quitRequested = new Promise<void>(resolve => {
+    const quitRequested = new Promise<void>((resolve) => {
       // monkey patch the repl servers ttyWrite to redirect input
       const ttyWrite = (this.repl as any)._ttyWrite
 
@@ -410,7 +471,7 @@ class Job {
   constructor(
     public name: string,
     public config: JobConfig,
-    public outputStream: Writable,
+    public outputStream: CircularLineBuffer,
     private secretsFilename: string,
     private onAutoConnect: (matchedOutput: string) => void,
   ) {
@@ -445,7 +506,7 @@ class Job {
       env: { ...process.env, ...this.config.env, ...secrets } as JobConfig['env'],
       cwd: process.cwd(),
     })
-    const outputListener = this.pty.onData(data => {
+    const outputListener = this.pty.onData((data) => {
       if (this.autoconnect && this.autoconnect.test(data)) {
         this.onAutoConnect(data)
       }
@@ -508,7 +569,7 @@ class Job {
       }
     }, 3000)
     const pty = this.pty
-    return new Promise(resolve => {
+    return new Promise((resolve) => {
       pty.onExit(() => {
         resolve()
       })
@@ -543,14 +604,14 @@ class Job {
 
 function formatDate(date: Date) {
   const s = [date.getFullYear(), date.getMonth() + 1, date.getDate()]
-    .map(n => n.toString().padStart(2, '0'))
+    .map((n) => n.toString().padStart(2, '0'))
     .join('-')
   return `${formatTime(date)} on ${s}`
 }
 
 function formatTime(date: Date) {
   return [date.getHours(), date.getMinutes(), date.getSeconds()]
-    .map(n => n.toString().padStart(2, '0'))
+    .map((n) => n.toString().padStart(2, '0'))
     .join(':')
 }
 
@@ -628,7 +689,7 @@ function main() {
     },
 
     // process management
-    start: argv => {
+    start: (argv) => {
       const args = minimist(argv, { boolean: ['all'], alias: { all: 'a' } })
       const jobs = coordinator.getJobs(args._)
 
@@ -640,7 +701,7 @@ function main() {
         }
       }
 
-      jobs.forEach(job => {
+      jobs.forEach((job) => {
         if (job.state !== JobState.Stopped) {
           log('job already running:', job.name)
         } else {
@@ -649,20 +710,20 @@ function main() {
       })
     },
 
-    stop: async jobNames => {
+    stop: async (jobNames) => {
       const jobs = coordinator.getJobs(jobNames)
       if (jobs.length === 0) {
         jobs.push(...coordinator.jobs.values())
       }
-      await Promise.all(jobs.map(job => job.stop()))
+      await Promise.all(jobs.map((job) => job.stop()))
     },
 
-    restart: async jobNames => {
+    restart: async (jobNames) => {
       const jobs = coordinator.getJobs(jobNames)
       if (jobs.length === 0) {
         throw new ArgumentError('restart requires one or more job names')
       }
-      await Promise.all(jobs.map(job => job.restart()))
+      await Promise.all(jobs.map((job) => job.restart()))
     },
 
     status: () => {
@@ -678,7 +739,7 @@ function main() {
       console.table(statuses)
     },
 
-    connect: async argv => {
+    connect: async (argv) => {
       if (argv.length !== 1 || !argv[0].trim()) {
         throw new ArgumentError('exactly one job argument is required')
       }
@@ -698,12 +759,12 @@ function main() {
       setTerminalTitle('dev-mode')
     },
 
-    tail: async jobNames => {
+    tail: async (jobNames) => {
       const jobs =
         jobNames.length === 0
           ? [...coordinator.jobs.values()]
           : jobNames
-              .map(name => {
+              .map((name) => {
                 if (coordinator.jobs.has(name)) {
                   return coordinator.jobs.get(name)
                 } else {
@@ -715,36 +776,31 @@ function main() {
       if (jobs.length < jobNames.length) {
         return
       }
-      const prefixLen = Math.max(...jobNames.map(n => n.length))
-      const cleanup = jobs.map(job => {
-        const prefix = job.name.padEnd(prefixLen, ' ') + ' | '
-        let partialLine = ''
-        const onData = (data: string) => {
-          const lines = data.toString().split('\n')
-          if (lines.length) {
-            lines[0] = partialLine + lines[0]
-          }
-          if (lines.length) {
-            partialLine = lines.pop()!
-          }
-          process.stdout.write(lines.map(line => prefix + line).join('\n') + '\n')
+      const prefixLen = Math.max(...jobNames.map((n) => n.length))
+      const cleanup = jobs.map((job) => {
+        const prefixer = new Prefixer({ prefix: job.name.padEnd(prefixLen, ' ') + ' | ' })
+        prefixer.pipe(process.stdout)
+        const printPrefixedLine = (line: string) => {
+          prefixer.write(line)
         }
-        job.outputStream.on('data', onData)
+        job.outputStream.writeBufferedLinesTo(prefixer)
+        job.outputStream.on('line', printPrefixedLine)
         return () => {
-          job.outputStream.removeListener('data', onData)
+          prefixer.unpipe(process.stdout)
+          job.outputStream.removeListener('line', printPrefixedLine)
         }
       })
       const [restoreInput, quitRequested] = coordinator.enterCommandMode()
       try {
         await quitRequested
       } finally {
-        cleanup.forEach(cb => cb())
+        cleanup.forEach((cb) => cb())
         restoreInput()
       }
     },
 
     // job management
-    add: argv => {
+    add: (argv) => {
       const args = minimist(argv, {
         stopEarly: true,
         default: { autostart: true, restart: true },
@@ -764,13 +820,13 @@ function main() {
         const [key, val] = args.env.split('=', 2)
         env[key] = val
       } else if (Array.isArray(args.env)) {
-        args.env.forEach(pair => {
+        args.env.forEach((pair) => {
           const [key, val] = pair.split('=', 2)
           env[key] = val
         })
       }
       const cmd = args._.slice(1)
-        .map(s => (s.indexOf(' ') < 0 ? s : JSON.stringify(s)))
+        .map((s) => (s.indexOf(' ') < 0 ? s : JSON.stringify(s)))
         .join(' ')
       updateConfig(['jobs', name], { cmd, autostart: args.autostart, restart: args.restart, env })
     },
@@ -798,7 +854,7 @@ function main() {
         }
       }
     },
-    set: args => {
+    set: (args) => {
       if (args.length !== 2) {
         console.error('set requires 2 arguments, a path and a value')
         return
