@@ -1,6 +1,6 @@
 {
   "name": "@grncdr/dev-mode",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "An interactive process monitor for development time",
   "repository": {
     "type": "git",
