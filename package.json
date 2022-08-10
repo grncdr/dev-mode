@@ -19,7 +19,7 @@
   "license": "GPL-3.0-or-later",
   "dependencies": {
     "minimist": "^1.2.6",
-    "node-pty": "^0.9.0-beta26",
+    "node-pty": "^0.10.0",
     "shell-split": "^1.0.0"
   },
   "devDependencies": {
