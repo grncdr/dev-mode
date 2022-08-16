@@ -290,7 +290,8 @@ class Coordinator {
       }
     }
     for (const [name, jobConfig] of Object.entries(config.jobs)) {
-      if (this.jobs.has(name)) {
+      let job
+      if ((job = this.jobs.get(name))) {
         this.jobs.get(name)!.applyConfig(jobConfig)
       } else {
         const logFilename = `${config.logdir}/${name}.log`
