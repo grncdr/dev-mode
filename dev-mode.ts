@@ -459,14 +459,18 @@ enum JobState {
   Stopping,
 }
 
+const InitialRestartDelay = 666
+
 class Job {
   public state: JobState
   public pty?: IPty
   public startedAt?: Date
   public exitCode?: number
+  public failureCount: number
 
   private timeout?: NodeJS.Timeout
   private autoconnect?: RegExp
+  private restartDelay: number
 
   constructor(
     public name: string,
@@ -479,6 +483,8 @@ class Job {
     this.pty = undefined
     this.startedAt = undefined
     this.timeout = undefined
+    this.restartDelay = InitialRestartDelay
+    this.failureCount = 0
     if (this.config.autoconnect) {
       this.autoconnect = new RegExp(this.config.autoconnect)
     }
@@ -500,12 +506,20 @@ class Job {
           this.restart()
         })
     }
+
+    this.startedAt = new Date()
     // Spawn the actual child process
     this.pty = spawn('bash', ['-c', this.config.cmd], {
       name: 'xterm-256color',
       env: { ...process.env, ...this.config.env, ...secrets } as JobConfig['env'],
       cwd: process.cwd(),
     })
+    this.pty.on('exit', (code, signal) => this.onExit(code, signal ? signal.toString() : undefined))
+    this.state = JobState.Started
+    this.exitCode = undefined
+
+    log('started', this.name, '(PID: ' + this.pty.pid + ')')
+
     const outputListener = this.pty.onData((data) => {
       if (this.autoconnect && this.autoconnect.test(data)) {
         this.onAutoConnect(data)
@@ -516,23 +530,23 @@ class Job {
       outputListener.dispose()
       exitListener.dispose()
     })
-    this.startedAt = new Date()
-    this.exitCode = undefined
     // this.exitSignal = undefined;
-    log('started', this.name, '(PID: ' + this.pty.pid + ')')
-    this.pty.on('exit', (code, signal) => this.onExit(code, signal ? signal.toString() : undefined))
-    this.state = JobState.Started
-    this.pty.pid
   }
 
   applyConfig(next: JobConfig) {
     const prev = this.config
+    const isEqual =
+      next.cmd == prev.cmd && deepEqual(next.env, prev.env) && next.autostart == prev.autostart
     this.config = next
-    if (
-      (next.cmd !== prev.cmd || !deepEqual(next.env, prev.env)) &&
-      this.state !== JobState.Stopped
-    ) {
+    if (isEqual) {
+      return
+    }
+    this.failureCount = 0
+    this.restartDelay = InitialRestartDelay
+    if (this.state !== JobState.Stopped) {
       this.restart()
+    } else if (this.config.autostart) {
+      this.start()
     }
   }
 
@@ -559,6 +573,7 @@ class Job {
 
   kill() {
     if (!this.pty) {
+      this.state = JobState.Stopped
       return
     }
     this.clearTimeout()
@@ -579,25 +594,36 @@ class Job {
 
   onExit(code?: number, signal?: string) {
     this.clearTimeout()
-    log(this.name, 'exited', `(code: ${code}, signal: ${signal})`)
-
-    const nextRestart = this.startedAt!.getTime() + 5000
+    const started = this.startedAt!.getTime()
+    const nextRestart = started + this.restartDelay
+    const now = Date.now()
+    const duration = now - started
+    log(this.name, 'exited', `(code: ${code}, signal: ${signal}, runtime: ${duration}ms)`)
 
     this.startedAt = undefined
     this.pty = undefined
     this.exitCode = code
 
-    if (this.state === JobState.Stopping || this.config.restart === false) {
+    if (typeof code !== 'number' || code > 0) {
+      this.failureCount += 1
+    }
+
+    if (
+      this.state === JobState.Stopping ||
+      this.config.restart === false ||
+      this.failureCount > 5
+    ) {
       this.state = JobState.Stopped
       return
     }
 
-    if (Date.now() > nextRestart) {
+    if (now > nextRestart) {
       this.state = JobState.Restarting
       this.start()
     } else {
       this.state = JobState.Waiting
-      setTimeout(() => this.start(), Date.now() - nextRestart)
+      this.restartDelay = Math.round(this.restartDelay * 1.5)
+      this.timeout = setTimeout(() => this.start(), nextRestart - now)
     }
   }
 }
@@ -734,6 +760,7 @@ function main() {
           state: JobState[job.state],
           'started at': job.startedAt ? formatDate(job.startedAt) : undefined,
           'exit code': typeof job.exitCode === 'number' ? job.exitCode : undefined,
+          failures: job.failureCount,
         }
       }
       console.table(statuses)
