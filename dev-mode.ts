@@ -930,13 +930,37 @@ function main() {
     }
   }
 
-  fs.watch(configFilename, { persistent: false }, () => coordinator.evalCommand('reload'))
+  watchFile(configFilename, () => coordinator.evalCommand('reload'))
 
   coordinator.evalCommand('reload')
   const r = coordinator.startRepl()
   r.on('exit', () => coordinator.evalCommand('stop'))
   process.on('exit', () => coordinator.evalCommand('stop'))
   setTerminalTitle('dev-mode')
+}
+
+function watchFile(filepath: string, callback: () => void) {
+  let fpath = path.resolve(filepath)
+  let dir = path.dirname(fpath)
+  let fname = path.basename(fpath)
+
+  let timeout: NodeJS.Timeout
+  fs.statSync(dir)
+
+  return fs.watch(dir, { persistent: false, recursive: false }, function (event, changed_fname) {
+    if (changed_fname !== fname) {
+      return
+    }
+    if (timeout) {
+      clearTimeout(timeout)
+    }
+
+    timeout = setTimeout(() => {
+      fs.stat(fpath, function (err) {
+        if (!err) callback()
+      })
+    }, 250)
+  })
 }
 
 main()
