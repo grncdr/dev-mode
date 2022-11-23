@@ -551,9 +551,16 @@ class Job {
     }
   }
 
-  restart() {
-    this.state = JobState.Restarting
-    return this.kill()
+  restart(resetFailures = false) {
+    if (resetFailures) {
+      this.failureCount = 0
+    }
+    if (this.state === JobState.Stopped) {
+      return this.start()
+    } else {
+      this.state = JobState.Restarting
+      return this.kill()
+    }
   }
 
   stop() {
@@ -750,7 +757,7 @@ function main() {
       if (jobs.length === 0) {
         throw new ArgumentError('restart requires one or more job names')
       }
-      await Promise.all(jobs.map((job) => job.restart()))
+      await Promise.all(jobs.map((job) => job.restart(true)))
     },
 
     status: () => {
